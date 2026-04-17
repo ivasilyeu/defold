@@ -18,7 +18,7 @@
             [util.fn :as fn])
   (:import [java.lang Math]
            [java.math RoundingMode]
-           [javax.vecmath Matrix3d Matrix3f Matrix4d Matrix4f Point3d Quat4d SingularMatrixException Tuple2d Tuple3d Tuple4d Vector3d Vector4d]))
+           [javax.vecmath Matrix3d Matrix3f Matrix4d Matrix4f Point3d Quat4d SingularMatrixException Tuple2d Tuple3d Tuple4d VecmathUtils Vector3d Vector4d]))
 
 (set! *warn-on-reflection* true)
 
@@ -183,26 +183,22 @@
     (Quat4d. 0.0 0.0 s c)))
 
 (defn quat-components->euler [^double x ^double y ^double z ^double w]
-  (if (= 0.0 x y)
-    (let [ha (Math/atan2 z w)]
-      [0.0 0.0 (rad->deg (* 2.0 ha))])
-    (let [test (+ (* x y) (* z w))]
-      (cond
-        (or (> test 0.499) (< test -0.499)) ; singularity at north pole
-        (let [sign (Math/signum test)
-              heading (* sign 2.0 (Math/atan2 x w))
-              attitude (* sign Math/PI 0.5)
-              bank 0.0]
-          [(rad->deg bank) (rad->deg heading) (rad->deg attitude)])
-
-        :default
-        (let [sqx (* x x)
-              sqy (* y y)
-              sqz (* z z)
-              heading (Math/atan2 (- (* 2.0 y w) (* 2.0 x z)) (- 1.0 (* 2.0 sqy) (* 2.0 sqz)))
-              attitude (Math/asin (* 2.0 test))
-              bank (Math/atan2 (- (* 2.0 x w) (* 2.0 y z)) (- 1.0 (* 2.0 sqx) (* 2.0 sqz)))]
-          [(rad->deg bank) (rad->deg heading) (rad->deg attitude)])))))
+  ; Extract XYZ angles for the YZX rotation sequence used by euler->quat.
+  (let [m00 (- 1.0 (* 2.0 y y) (* 2.0 z z))
+        m10 (+ (* 2.0 x y) (* 2.0 z w))
+        m11 (- 1.0 (* 2.0 x x) (* 2.0 z z))
+        m12 (- (* 2.0 y z) (* 2.0 x w))
+        m20 (- (* 2.0 x z) (* 2.0 y w))
+        m21 (+ (* 2.0 y z) (* 2.0 x w))
+        m22 (- 1.0 (* 2.0 x x) (* 2.0 y y))
+        attitude (Math/asin (max -1.0 (min 1.0 m10)))
+        cos-attitude (Math/cos attitude)]
+    (if (> (Math/abs cos-attitude) epsilon)
+      (let [heading (Math/atan2 (- m20) m00)
+            bank (Math/atan2 (- m12) m11)]
+        [(rad->deg bank) (rad->deg heading) (rad->deg attitude)])
+      (let [bank (Math/atan2 m21 m22)]
+        [(rad->deg bank) 0.0 (rad->deg attitude)]))))
 
 (defn quat->euler [^Quat4d quat]
   (quat-components->euler (.getX quat) (.getY quat) (.getZ quat) (.getW quat)))
@@ -373,7 +369,8 @@
      (.mul q1 q)
      q1)))
 
-(defn from-to->quat [^Vector3d unit-from ^Vector3d unit-to]
+(defn from-to->quat
+  ^Quat4d [^Vector3d unit-from ^Vector3d unit-to]
   (let [dot (.dot unit-from unit-to)]
     (let [cos-half (Math/sqrt (* 2.0 (+ 1.0 dot)))
           recip-cos-half (/ 1.0 cos-half)
@@ -430,24 +427,67 @@
      (.setElement 2 2 z-scale)
      (.setElement 3 3 1.0))))
 
+(defn split-mat4 [^Matrix4d matrix ^Tuple3d out-translation ^Quat4d out-rotation ^Vector3d out-scale]
+  ;; TODO: Scale does not take negative values into account.
+  (VecmathUtils/extractTranslationRotationScale matrix out-translation out-rotation out-scale))
+
+#_
+(defn split-mat4 [^Matrix4d matrix ^Tuple3d out-translation ^Quat4d out-rotation ^Vector3d out-scale]
+  ;; Extract the translation from the fourth column.
+  (let [translation (Vector4d.)]
+    (.getColumn matrix 3 translation)
+    (.set out-translation (.-x translation) (.-y translation) (.-z translation)))
+
+  ;; Extract rotation & scale.
+  (let [rotation-matrix (Matrix3d.)
+        scale-xyz (double-array 3)
+        rotation-mat3-values (double-array 9)
+        #_#_
+        scaled-axis (Vector3d.)]
+    (.getRotationScale matrix rotation-matrix)
+    #_
+    (Matrix3d/compute_svd (double-array 9) (double-array 3) (double-array 9))
+    (.getScaleRotate rotation-matrix scale-xyz rotation-mat3-values)
+    (.set out-scale scale-xyz)#_#_#_#_
+    (coll/run!-> (range 3)
+      (fn [^long column-index]
+        (.getColumn rotation-matrix column-index scaled-axis)
+        (let [axis-scale (.length scaled-axis)]
+          (aset scale-xyz column-index axis-scale))))
+    (.normalize rotation-matrix)
+    (.set out-rotation rotation-matrix)
+    (.set out-scale scale-xyz)))
+
+#_
 (defn split-mat4 [^Matrix4d mat ^Tuple3d out-position ^Quat4d out-rotation ^Vector3d out-scale]
-  (let [tmp (Vector4d.)
-        _ (.getColumn mat 3 tmp)
-        _ (.set out-position (.getX tmp) (.getY tmp) (.getZ tmp))
-        tmp (Vector3d.)
-        mat3 (Matrix3d.)
-        _ (.getRotationScale mat mat3)
-        scale (double-array 3)]
+  (let [temp-vec4 (Vector4d.)
+        _ (.getColumn mat 3 temp-vec4)
+        _ (.set out-position (.getX temp-vec4) (.getY temp-vec4) (.getZ temp-vec4))
+        rotation-scale (Matrix3d.)
+        _ (.getRotationScale mat rotation-scale)
+        temp-vec3 (Vector3d.)
+        axes (object-array 3)
+        scales (double-array 3)]
     (doseq [^long col (range 3)]
-      (.getColumn mat3 col tmp)
-      (let [s (.length tmp)
-            ^Vector3d axis (if (> s epsilon)
-                             (doto tmp (.scale (/ 1.0 s)))
-                             (unit-axis col))]
-        (aset scale col s)
-        (.setColumn mat3 col axis))
-      (.set out-rotation mat3)
-      (.set out-scale scale))))
+      (.getColumn rotation-scale col temp-vec3)
+      (let [scale (.length temp-vec3)
+            axis (if (> scale epsilon)
+                   (doto (Vector3d. temp-vec3)
+                     (.scale (/ 1.0 scale)))
+                   (unit-axis col))]
+        (aset axes col axis)
+        (aset scales col scale)))
+    (let [^Vector3d axis-x (aget axes 0)
+          ^Vector3d axis-y (aget axes 1)
+          ^Vector3d axis-z (aget axes 2)
+          handedness (.dot (doto (Vector3d.) (.cross axis-x axis-y)) axis-z)]
+      (when (neg? handedness)
+        (.negate axis-z)
+        (aset scales 2 (- (aget scales 2)))))
+    (doseq [^long col (range 3)]
+      (.setColumn rotation-scale col ^Vector3d (aget axes col)))
+    (.set out-rotation rotation-scale)
+    (.set out-scale scales)))
 
 (defn inverse
   "Calculate the inverse of a matrix."
